@@ -114,7 +114,7 @@ class MockHEManager:
             secret = secrets.token_hex(16)
             data = {"secret": secret}
             _save_json(self.key_path, data)
-        self.secret = data["secret"]
+        self.secret = data["secret"] # t
 
     # -------- basic API --------
     def encrypt_vec(self, ints: List[int]) -> _Ciphertext:
