@@ -1,60 +1,43 @@
 """
 encryption_module.py
-Student-prototype encryption layer for NoirLink (PPEC).
 
-Provides:
-- MockHEManager: Simulated Homomorphic Encryption for integer vectors (add/sub/mul/squared_diff).
-- MockOPEManager: Order-preserving "encryption" (affine transform with positive scale).
+Dual-mode encryption module for NoirLink:
+- Mock mode: fast simulated encryption (for demos / if building Pyfhel is not possible)
+- Real mode: uses Pyfhel (BFV-like integer HE) for real homomorphic encryption
 
-Keys are saved under models/ to keep runs reproducible.
+Switch mode by setting environment variable NOIRLINK_HE:
+- NOIRLINK_HE=real    -> use Pyfhel
+- NOIRLINK_HE=mock    -> use lightweight mock (default)
 
-USAGE:
-from encryption_module import MockHEManager, MockOPEManager
-
-he = MockHEManager()
-ct_a = he.encrypt_vec([5, 3, 1])
-ct_b = he.encrypt_vec([2, 4, 7])
-ct_diff2 = he.squared_diff(ct_a, ct_b)
-print("Dec:", he.decrypt_vec(ct_diff2))  # [9, 1, 36]
-
-ope = MockOPEManager()
-ea = ope.encrypt(42); eb = ope.encrypt(100)
-print("Order preserved:", ea < eb)       # True
-print("Decrypt back:", ope.decrypt(ea))  # 42
+API classes:
+- HEManager (abstracted): encrypt_vec, decrypt_vec, add, sub, mul, squared_diff_ct, squared_euclidean_ct, decrypt_scalar
+- OPEManager (affine order-preserving substitution): encrypt, decrypt, encrypt_list, decrypt_list, less_than
 """
 
 import os
 import json
 import secrets
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List
+import numpy as np
 
+USE_REAL = os.environ.get("NOIRLINK_HE", "mock").lower() == "real"
 
-# ------------------------------
-# Utilities: simple persistent key store
-# ------------------------------
+# --------- OPE (affine transform) - same as before (simple, not cryptographically strong) -----
 def _ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-def _save_json(path: str, obj: dict):
+def _save_json(path: str, obj):
     _ensure_dir(os.path.dirname(path))
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f)
 
-def _load_json(path: str) -> Optional[dict]:
+def _load_json(path: str):
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return None
 
-
-# ------------------------------
-# Mock OPE (Order Preserving "Encryption")
-#   y = a * x + b, with a > 0  (so order is preserved strictly)
-#   a, b are secret; integers.
-#   This is NOT secure crypto; it's for classroom/demo use only.
-# ------------------------------
-class MockOPEManager:
+class OPEManager:
     def __init__(self, key_dir: str = "models/ope_keys", key_file: str = "ope_key.json"):
         self.key_path = os.path.join(key_dir, key_file)
         self._load_or_create_key()
@@ -62,10 +45,8 @@ class MockOPEManager:
     def _load_or_create_key(self):
         data = _load_json(self.key_path)
         if data is None:
-            # Choose positive scale a and offset b.
-            # Keep a reasonably large to obscure small differences, but positive to preserve order.
-            a = secrets.randbelow(10_000) + 1   # in [1..10000]
-            b = secrets.randbelow(1_000_000)    # in [0..1e6)
+            a = secrets.randbelow(10_000) + 1
+            b = secrets.randbelow(1_000_000)
             data = {"a": a, "b": b}
             _save_json(self.key_path, data)
         self.a = int(data["a"])
@@ -75,12 +56,10 @@ class MockOPEManager:
         return int(self.a * int(x) + self.b)
 
     def decrypt(self, y: int) -> int:
-        # Integer inverse (assumes exact transform); rounding just in case.
         return int(round((int(y) - self.b) / self.a))
 
-    # Order-preserving comparisons can be done directly on ciphertexts:
-    def less_than(self, enc_x: int, enc_y: int) -> bool:
-        return enc_x < enc_y
+    def less_than(self, ca: int, cb: int) -> bool:
+        return ca < cb
 
     def encrypt_list(self, xs: List[int]) -> List[int]:
         return [self.encrypt(x) for x in xs]
@@ -89,120 +68,174 @@ class MockOPEManager:
         return [self.decrypt(y) for y in ys]
 
 
-# ------------------------------
-# Mock HE (Homomorphic-like operations)
-#   We wrap integer vectors in a Ciphertext object. Operations are done on the wrapped data.
-#   This mimics the programming model of HE without requiring native libraries.
-#   DO NOT use for security; it's meant to let the algorithm pipeline run end-to-end.
-# ------------------------------
-@dataclass
-class _Ciphertext:
-    # Stores an integer vector. In real HE this would be an opaque ciphertext blob.
-    data: List[int]
-    # "noise" or "nonce" simulated for realism (unused but kept to resemble HE objects)
-    nonce: int = 0
+# ---------------- MOCK HE (if NOIRLINK_HE != "real") ----------------
+if not USE_REAL:
+    from dataclasses import dataclass
 
-class MockHEManager:
-    def __init__(self, key_dir: str = "models/he_keys", key_file: str = "he_key.json"):
-        self.key_path = os.path.join(key_dir, key_file)
-        self._load_or_create_key()
+    @dataclass
+    class _CT:
+        data: List[int]
+        nonce: int = 0
 
-    def _load_or_create_key(self):
-        data = _load_json(self.key_path)
-        if data is None:
-            # In real HE you'd store public/secret keys. Here we keep a dummy secret.
-            secret = secrets.token_hex(16)
-            data = {"secret": secret}
-            _save_json(self.key_path, data)
-        self.secret = data["secret"] 
+    class HEManager:
+        def __init__(self, key_dir="models/he_keys", key_file="he_key.json"):
+            self.key_path = os.path.join(key_dir, key_file)
+            data = _load_json(self.key_path)
+            if data is None:
+                _save_json(self.key_path, {"secret": secrets.token_hex(16)})
+            self.ope = OPEManager()
 
-    # -------- basic API --------
-    def encrypt_vec(self, ints: List[int]) -> _Ciphertext:
-        # Copy to avoid aliasing and simulate "ciphertext"
-        return _Ciphertext(data=[int(x) for x in ints], nonce=secrets.randbelow(1 << 30))
+        def encrypt_vec(self, ints: List[int]) -> _CT:
+            return _CT(data=[int(x) for x in ints], nonce=secrets.randbelow(1 << 30))
 
-    def decrypt_vec(self, ct: _Ciphertext) -> List[int]:
-        # In real HE, this uses the secret key. Here we just unwrap.
-        return list(ct.data)
+        def decrypt_vec(self, ct: _CT) -> List[int]:
+            return list(ct.data)
 
-    # Element-wise add/sub/mul of two ciphertext vectors (length must match)
-    def add(self, a: _Ciphertext, b: _Ciphertext) -> _Ciphertext:
-        self._assert_same_len(a, b)
-        return _Ciphertext([x + y for x, y in zip(a.data, b.data)], nonce=secrets.randbelow(1 << 30))
+        def add(self, a: _CT, b: _CT) -> _CT:
+            return _CT([x + y for x, y in zip(a.data, b.data)])
 
-    def sub(self, a: _Ciphertext, b: _Ciphertext) -> _Ciphertext:
-        self._assert_same_len(a, b)
-        return _Ciphertext([x - y for x, y in zip(a.data, b.data)], nonce=secrets.randbelow(1 << 30))
+        def sub(self, a: _CT, b: _CT) -> _CT:
+            return _CT([x - y for x, y in zip(a.data, b.data)])
 
-    def mul(self, a: _Ciphertext, b: _Ciphertext) -> _Ciphertext:
-        self._assert_same_len(a, b)
-        return _Ciphertext([x * y for x, y in zip(a.data, b.data)], nonce=secrets.randbelow(1 << 30))
+        def mul(self, a: _CT, b: _CT) -> _CT:
+            return _CT([x * y for x, y in zip(a.data, b.data)])
 
-    # Add/multiply ciphertext with a plaintext vector (same length) or scalar
-    def add_plain(self, a: _Ciphertext, p) -> _Ciphertext:
-        if isinstance(p, list):
-            if len(p) != len(a.data): raise ValueError("Length mismatch in add_plain.")
-            out = [x + int(y) for x, y in zip(a.data, p)]
-        else:
-            out = [x + int(p) for x in a.data]
-        return _Ciphertext(out, nonce=secrets.randbelow(1 << 30))
+        def squared_diff_ct(self, x: _CT, y: _CT) -> _CT:
+            return _CT([(a - b) * (a - b) for a, b in zip(x.data, y.data)])
 
-    def mul_plain(self, a: _Ciphertext, p) -> _Ciphertext:
-        if isinstance(p, list):
-            if len(p) != len(a.data): raise ValueError("Length mismatch in mul_plain.")
-            out = [x * int(y) for x, y in zip(a.data, p)]
-        else:
-            out = [x * int(p) for x in a.data]
-        return _Ciphertext(out, nonce=secrets.randbelow(1 << 30))
+        def squared_euclidean_ct(self, x: _CT, y: _CT):
+            val = int(sum((a - b) * (a - b) for a, b in zip(x.data, y.data)))
+            return _CT([val])
 
-    # -------- helpers for distance-like ops --------
-    def squared_diff(self, x: _Ciphertext, y: _Ciphertext) -> _Ciphertext:
-        """Element-wise (x - y)^2."""
-        self._assert_same_len(x, y)
-        out = [(a - b) * (a - b) for a, b in zip(x.data, y.data)]
-        return _Ciphertext(out, nonce=secrets.randbelow(1 << 30))
+        def decrypt_scalar(self, ct):
+            if isinstance(ct, _CT):
+                return int(ct.data[0])
+            raise ValueError("Unsupported ct type for mock decrypt_scalar")
+# ---------------- REAL HE using Pyfhel (if NOIRLINK_HE=real) ----------------
+else:
+    try:
+        from Pyfhel import Pyfhel, PyCtxt
+    except Exception as e:
+        raise ImportError("Pyfhel is required for REAL HE mode. Install it after Visual C++ Build Tools + CMake. Error: " + str(e))
 
-    def sum_cipher(self, a: _Ciphertext) -> int:
-        """Return plaintext sum of elements of a ciphertext vector.
-        In real HE you'd return a ciphertext reduced sum; here we keep it simple for the prototype."""
-        return int(sum(a.data))
+    class HEManager:
+        """
+        Real HE manager using Pyfhel (BFV-like integer operations).
+        - encrypt_vec: encrypts each integer as a ciphertext (list of PyCtxt)
+        - decrypt_vec: decrypts list of ciphertexts to ints
+        - arithmetic ops: add, sub, mul perform ciphertext arithmetic
+        - squared_euclidean_ct returns a ciphertext that encrypts the scalar sum; decrypt_scalar will decrypt it
+        """
+        def __init__(self, key_dir="models/he_keys", key_file="pyfhel_keys.json"):
+            self.key_dir = key_dir
+            os.makedirs(self.key_dir, exist_ok=True)
+            self.key_file = os.path.join(self.key_dir, key_file)
 
-    def squared_euclidean(self, x: _Ciphertext, y: _Ciphertext) -> int:
-        """Return plaintext scalar ∑(xi - yi)^2. (Prototype simplification)
-        In real HE you'd keep it encrypted. For the demo, we expose a scalar distance."""
-        self._assert_same_len(x, y)
-        return int(sum((a - b) * (a - b) for a, b in zip(x.data, y.data)))
+            self.P = Pyfhel()
+            p_params = {
+                'scheme': 'BFV',
+                'n': 4096,
+                't': 65537,
+                'scale': 2
+            }
+            self.P.contextGen(**p_params)
+            self.P.keyGen()
+            self.P.relinKeyGen()
 
-    # -------- internal --------
-    @staticmethod
-    def _assert_same_len(a: _Ciphertext, b: _Ciphertext):
-        if len(a.data) != len(b.data):
-            raise ValueError("Ciphertext vector length mismatch.")
+            self.P.save_public_key(os.path.join(self.key_dir, "pyfhel_pub.key"))
+            self.P.save_secret_key(os.path.join(self.key_dir, "pyfhel_sec.key"))
+
+            self.ope = OPEManager()
+
+        def encrypt_vec(self, ints: List[int]) -> List[PyCtxt]:
+            out = []
+            for x in ints:
+                out.append(self.P.encrypt(np.array([x], dtype=np.int64)))
+            return out
+
+        def decrypt_vec(self, cts: List[PyCtxt]) -> List[int]:
+            out = []
+            for ct in cts:
+                out.append(int(self.P.decryptInt(ct)[0]))
+            return out
+
+        def add(self, a: List[PyCtxt], b: List[PyCtxt]) -> List[PyCtxt]:
+            return [self.P.add(cta, ctb) for cta, ctb in zip(a, b)]
+
+        def sub(self, a: List[PyCtxt], b: List[PyCtxt]) -> List[PyCtxt]:
+            return [self.P.sub(cta, ctb) for cta, ctb in zip(a, b)]
+
+        def mul(self, a: List[PyCtxt], b: List[PyCtxt]) -> List[PyCtxt]:
+            res = []
+            for cta, ctb in zip(a, b):
+                ct_mul = self.P.multiply(cta, ctb)
+                self.P.relinearize(ct_mul)
+                res.append(ct_mul)
+            return res
+
+        def squared_diff_ct(self, x: List[PyCtxt], y: List[PyCtxt]) -> List[PyCtxt]:
+            out = []
+            for cta, ctb in zip(x, y):
+                diff = self.P.sub(cta, ctb)
+                sq = self.P.multiply(diff, diff)
+                self.P.relinearize(sq)
+                out.append(sq)
+            return out
+
+        def squared_euclidean_ct(self, x: List[PyCtxt], y: List[PyCtxt]) -> PyCtxt:
+            sqs = self.squared_diff_ct(x, y)
+            acc = sqs[0]
+            for ct in sqs[1:]:
+                acc = self.P.add(acc, ct)
+            return acc
+
+        def decrypt_scalar(self, ct: PyCtxt) -> int:
+            val = self.P.decryptInt(ct)
+            return int(val[0])
+
+# Expose a factory/helper to create managers
+def get_managers(mode: str = None):
+    """
+    mode: "real" or "mock" or None (uses NOIRLINK_HE env)
+    returns (he_manager_instance, ope_manager_instance)
+    """
+    if mode is None:
+        mode = "real" if USE_REAL else "mock"
+    
+    he = HEManager()
+    ope = OPEManager()
+    return he, ope
 
 
-# ------------------------------
+# ------------------
 # Quick smoke test when run directly
-# ------------------------------
+# ------------------
 def _demo_quick():
-    print("=== Mock HE demo ===")
-    he = MockHEManager()
-    ct1 = he.encrypt_vec([5, 3, 1])
-    ct2 = he.encrypt_vec([2, 4, 7])
+    print(f"Current mode: {'REAL' if USE_REAL else 'MOCK'}")
+    
+    he, ope = get_managers()
 
-    ct_add = he.add(ct1, ct2)         # [7, 7, 8]
-    ct_mul = he.mul(ct1, ct2)         # [10, 12, 7]
-    ct_sd  = he.squared_diff(ct1, ct2)  # [(5-2)^2, (3-4)^2, (1-7)^2] = [9, 1, 36]
+    print("\n=== HE demo ===")
+    v1 = [5, 3, 1]
+    v2 = [2, 4, 7]
+    ct1 = he.encrypt_vec(v1)
+    ct2 = he.encrypt_vec(v2)
+    print(f"Encrypting vector 1: {v1}")
+    print(f"Encrypting vector 2: {v2}")
+
+    ct_add = he.add(ct1, ct2)
+    ct_mul = he.mul(ct1, ct2)
+    ct_sd = he.squared_diff_ct(ct1, ct2)
     print("add   :", he.decrypt_vec(ct_add))
     print("mul   :", he.decrypt_vec(ct_mul))
     print("sdiff :", he.decrypt_vec(ct_sd))
-    print("dist² :", he.squared_euclidean(ct1, ct2))  # 46
+    print("dist² :", he.decrypt_scalar(he.squared_euclidean_ct(ct1, ct2)))
 
-    print("\n=== Mock OPE demo ===")
-    ope = MockOPEManager()
+    print("\n=== OPE demo ===")
     ea = ope.encrypt(42)
     eb = ope.encrypt(100)
     print("enc(42) =", ea, " enc(100) =", eb)
-    print("order preserved:", ea < eb)
+    print("order preserved:", ope.less_than(ea, eb))
     print("dec(enc(42)) =", ope.decrypt(ea))
 
 if __name__ == "__main__":
