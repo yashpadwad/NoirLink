@@ -2,9 +2,10 @@
 Streamlit Dashboard for NoirLink (PPEC)
 ---------------------------------------
 - Loads clustered CDR data (data/cdr_clusters.csv)
-- Shows table of users + cluster
+- Shows table of users + cluster summary
 - Plots scatterplot of clusters
 - Verifies blockchain integrity automatically
+- Allows new user input for real-time classification
 """
 
 import streamlit as st
@@ -64,12 +65,59 @@ except FileNotFoundError:
 
 # Show data preview
 st.subheader("📊 Clustered Call Data")
-st.dataframe(df.head(20))
+st.dataframe(df.head(10)) # Showing 10 rows for a cleaner look
+
+# --- NEW: Re-organized Cluster Analytics Section ---
+st.subheader("📝 Cluster Analytics")
+feature_cols = ['calls_per_day', 'avg_call_duration_sec', 'avg_data_mb_per_day']
+
+try:
+    # Use columns for a neat side-by-side layout
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.info("This table shows the average profile of each cluster.")
+        # Group by cluster and calculate the mean for the feature columns
+        cluster_summary = df.groupby('cluster')[feature_cols].mean().round(1)
+        cluster_summary.columns = ["Avg Calls/Day", "Avg Duration (sec)", "Avg Data/Day (MB)"]
+        st.dataframe(cluster_summary, use_container_width=True)
+
+    with col2:
+        st.info("This chart shows the number of users in each cluster.")
+        # --- ADDED: Feature 1 - Cluster Size Distribution Plot ---
+        cluster_counts = df['cluster'].value_counts().sort_index()
+        fig_bar = px.bar(
+            cluster_counts, 
+            x=cluster_counts.index, 
+            y=cluster_counts.values,
+            labels={'x': 'Cluster ID', 'y': 'Number of Users'},
+            title="Cluster Population"
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    # --- ADDED: Feature 2 - Automatic Cluster Descriptions ---
+    st.subheader("🗣️ Automatic Cluster Profiles")
+    st.info("This section provides a simple, human-readable summary of each cluster's characteristics compared to the overall average.")
+    
+    overall_avg = df[feature_cols].mean()
+
+    for i, row in cluster_summary.iterrows():
+        # Compare cluster average to overall average to generate profile
+        calls_profile = "High" if row["Avg Calls/Day"] > overall_avg["calls_per_day"] * 1.1 else "Low"
+        duration_profile = "Long" if row["Avg Duration (sec)"] > overall_avg["avg_call_duration_sec"] * 1.1 else "Short"
+        data_profile = "Heavy" if row["Avg Data/Day (MB)"] > overall_avg["avg_data_mb_per_day"] * 1.1 else "Light"
+        
+        st.markdown(f"- **Cluster {i}:** Characterized by **{calls_profile} Calls**, **{duration_profile} Duration**, and **{data_profile} Data Usage**.")
+
+except Exception as e:
+    st.warning(f"Could not generate cluster analytics: {e}")
+# --- End of new section ---
+
 
 # Scatterplot
 st.subheader("🌀 Cluster Visualization")
-x_axis = st.selectbox("X-axis", options=df.columns[1:-1], index=0)
-y_axis = st.selectbox("Y-axis", options=df.columns[1:-1], index=1)
+x_axis = st.selectbox("X-axis", options=feature_cols, index=0)
+y_axis = st.selectbox("Y-axis", options=feature_cols, index=2)
 
 fig = px.scatter(
     df, x=x_axis, y=y_axis, color="cluster",
@@ -80,10 +128,10 @@ st.plotly_chart(fig, use_container_width=True)
 
 # Blockchain verification
 st.subheader("🔗 Blockchain Verification")
-file_hash = sha256_of_file(CSV_PATH)
-st.write("Local CSV SHA256:", file_hash)
-
 try:
+    file_hash = sha256_of_file(CSV_PATH)
+    st.write("Local CSV SHA256:", file_hash)
+
     w3 = Web3(Web3.HTTPProvider(GANACHE_RPC))
     if w3.is_connected():
         contract = load_contract(w3)
@@ -103,62 +151,42 @@ try:
 except Exception as e:
     st.error(f"Blockchain error: {e}")
 
-# ---------------------------
 # New User Input -> Cluster Assignment + Visualization
-# ---------------------------
-st.subheader("📝 Try Your Own Data")
+st.subheader("📍 Classify a New User")
 
-calls = st.number_input("Calls per day", min_value=0, max_value=50, value=10)
-duration = st.number_input("Average call duration (sec)", min_value=0, max_value=1000, value=200)
-data_usage = st.number_input("Average data usage per day (MB)", min_value=0, max_value=10000, value=3000)
+with st.form("new_user_form"):
+    calls = st.number_input("Calls per day", min_value=0, max_value=50, value=10)
+    duration = st.number_input("Average call duration (sec)", min_value=0, max_value=1000, value=200)
+    data_usage = st.number_input("Average data usage per day (MB)", min_value=0, max_value=10000, value=3000)
+    submitted = st.form_submit_button("Classify Me")
 
-if st.button("Classify Me"):
-    # Extract existing features + clusters
-    features = df[["calls_per_day", "avg_call_duration_sec", "avg_data_mb_per_day"]]
+if submitted:
+    features = df[feature_cols]
     clusters = df["cluster"]
 
-    # Create user point
     user_point = np.array([[calls, duration, data_usage]])
     dists = euclidean_distances(user_point, features)
     nearest_idx = dists.argmin()
     user_cluster = clusters.iloc[nearest_idx]
 
-    st.success(f"✅ Based on your input, you belong to **Cluster {user_cluster}**")
-    st.info(f"Closest existing user: {df.iloc[nearest_idx]['user_id']}")
+    st.success(f"✅ Based on your input, this user belongs to **Cluster {user_cluster}**")
+    st.info(f"Their profile is most similar to existing user: {df.iloc[nearest_idx]['user_id']}")
 
-    # Prepare scatter data
-    scatter_df = df.copy()
-    scatter_df["is_new_user"] = False
-
-    # Append new user row
-    new_user_df = pd.DataFrame({
-        "user_id": ["NEW_USER"],
-        "calls_per_day": [calls],
-        "avg_call_duration_sec": [duration],
-        "avg_data_mb_per_day": [data_usage],
-        "cluster": [user_cluster],
-        "is_new_user": [True]
-    })
-    scatter_df = pd.concat([scatter_df, new_user_df], ignore_index=True)
-
-    # Custom color assignment
-    # Change: We'll now add a new user to its assigned cluster visually, and use a larger symbol
-    # to highlight it. Plotly can't easily change symbol types based on data, but we can
-    # give the new user its own 'cluster' and then use a custom symbol.
-    
-    # Recalculate plot to include new user
-    fig = px.scatter(
-        scatter_df,
-        x=x_axis,
-        y=y_axis,
-        color="cluster", # Use the actual cluster label for color
-        hover_data=["user_id", "is_new_user"],
-        title=f"Clusters + Your Input (Belongs to Cluster {user_cluster})"
+    fig_new = px.scatter(
+        df, x=x_axis, y=y_axis, color="cluster",
+        hover_data=["user_id"],
+        title=f"Clusters with New User (Belongs to Cluster {user_cluster})"
     )
     
-    # Highlight the new user with a different symbol (e.g. star) and size
-    fig.add_scatter(
-        x=[calls], y=[duration],
+    new_user_data = {
+        'calls_per_day': calls,
+        'avg_call_duration_sec': duration,
+        'avg_data_mb_per_day': data_usage
+    }
+
+    fig_new.add_scatter(
+        x=[new_user_data[x_axis]], 
+        y=[new_user_data[y_axis]],
         mode='markers',
         marker=dict(
             color='red',
@@ -166,7 +194,7 @@ if st.button("Classify Me"):
             size=15,
             line=dict(width=2, color='DarkSlateGrey')
         ),
-        name="NEW_USER"
+        name="New User"
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig_new, use_container_width=True)
